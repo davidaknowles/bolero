@@ -102,12 +102,9 @@ K(\condvec) = K_0 + \Delta K(\condvec).
 \]
 Thus, the factorization rank in the flattened representation is $rk$; the code's LoRA
 rank parameter is $r$, and the kernel width is folded into both generated factors. For a
-two-dimensional convolution, the analogous generator shapes are
-\[
-A_c(\condvec)\in\mathbb{R}^{(rk)\times((i/g)k)},\qquad
-B_c(\condvec)\in\mathbb{R}^{(ok)\times(rk)},
-\]
-followed by reshaping $B_cA_c$ to $(o,i/g,k,k)$.
+two-dimensional convolution, the generic adapter module has an analogous branch, but
+Bolero's Borzoi architecture uses only one-dimensional convolutions over genomic position;
+the Conv2d branch is not used by this model.
 
 For a batch of $b$ examples, the one-dimensional implementation generates
 $K(\condvec_1),\ldots,K(\condvec_b)$, concatenates them into a grouped-convolution weight

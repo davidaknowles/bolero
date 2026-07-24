@@ -17,3 +17,7 @@ LoRA configuration presets, and the Borzoi training/data paths.
 Follow-up clarification: the note now gives the explicit grouped-convolution LoRA
 parameterization and identifies the current cell-state embeddings as 30-dimensional joint
 RNA--ATAC MULTIVI latents, rather than expression PCs.
+
+Removed the generic Conv2d equations from the note after checking the architecture: Bolero's
+Borzoi backbone uses only Conv1d layers over genomic position; Conv2d support in the adapter
+module is unused here.
