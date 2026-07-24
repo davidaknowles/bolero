@@ -1,0 +1,239 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\definecolor{boleroblue}{HTML}{245A7A}
+\definecolor{lightblue}{HTML}{EEF6FA}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=boleroblue,
+  urlcolor=boleroblue,
+  pdftitle={Conditioned LoRA in Bolero},
+  pdfauthor={Bolero project}
+}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\Wbase}{W_{0}}
+\newcommand{\condvec}{e}
+
+\title{Conditioned LoRA in Bolero}
+\author{Technical model note}
+\date{July 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Bolero is a cell-state-conditioned sequence-to-function model. It combines a frozen
+Borzoi/Flashzoi DNA backbone with low-rank adapters whose weights are generated from a
+cell-state embedding. The resulting effective network is different for each conditioning
+vector while sharing the expensive sequence model across cells. This note describes the
+conditioning path, the conditional LoRA parameterization, the paired signal-model training
+recipe, and inference by collapsing the adapters into a fixed network.
+\end{abstract}
+
+\section{Model overview}
+
+The model takes a long DNA sequence and a representation of the target cell state. The
+default sequence input is one-hot DNA of length 524,288 bp. The output is a chromatin or
+transcript track at 32 bp resolution. The backbone produces 16,384 internal output bins;
+the default training crop is 16,352 bins (see \code{crop\_to\_length} in
+\code{src/bolero/tl/model/borzoi/model.py}).
+
+The high-level computation is:
+
+\begin{center}
+\fbox{\parbox{0.88\linewidth}{
+\centering
+DNA sequence $x$ \, + \, cell state and optional conditions
+\quad $\longrightarrow$ \quad conditioning encoder $\longrightarrow$ $\condvec$
+\\[3pt]
+$x$ and $\condvec$ pass through a frozen Borzoi backbone with generated LoRA updates
+\quad $\longrightarrow$ \quad predicted track $\hat y$
+}}
+\end{center}
+
+The main implementation is \code{BorzoiLoRA} in
+\code{src/bolero/tl/model/borzoi/model\_lora.py}. The base checkpoint is loaded first,
+and selected convolutional and linear layers are then replaced by LoRA modules.
+
+\section{Conditional LoRA}
+
+\subsection{From ordinary LoRA to conditional LoRA}
+
+For a linear layer with frozen weight $\Wbase\in\mathbb{R}^{o\times i}$, ordinary LoRA
+uses a learned, input-independent low-rank update. Bolero instead generates both low-rank
+factors from the conditioning vector:
+
+\begin{align}
+A(\condvec) &\in \mathbb{R}^{r\times i},\\
+B(\condvec) &\in \mathbb{R}^{o\times r},\\
+W(\condvec) &= \Wbase + \frac{\alpha}{r}B(\condvec)A(\condvec).
+\end{align}
+
+Each factor is produced by a small MLP, implemented as an \code{EmbeddingMLP}. The MLPs
+are shared across all examples; only their outputs vary with $\condvec$. This amortizes
+the cost of learning a separate effective network for every cell state.
+
+The implementation stores the first factor with shape $(r,i)$ and the second with shape
+$(o,r)$, contracts them over the rank dimension, and adds the result to the frozen base
+weight. The scale is $\alpha/r$; with the default configuration, $\alpha$ is obtained from
+the rank and the configured LoRA scale.
+
+The same construction is used for convolutional layers. The generated update is reshaped
+to the convolution kernel shape. During a batched forward pass, each example's effective
+kernel is applied independently using a grouped convolution. Consequently, a batch may
+contain different cell-state-specific kernels without running the backbone once per cell.
+
+The conditional layer implementation is in
+\code{src/bolero/tl/generic/module\_lora\_cond.py}. Its two defining properties are:
+
+\begin{enumerate}[leftmargin=2em]
+  \item the pretrained base weight is frozen;
+  \item the $A$ and $B$ generators are trainable and initialized so the initial LoRA
+        update is zero (the final layer of the $B$ generator is zero-initialized).
+\end{enumerate}
+
+Zero initialization makes the converted model initially behave like the pretrained
+backbone, before the adapters learn a cell-state-dependent correction.
+
+\subsection{Which layers are adapted?}
+
+The default preset is \code{all\_conditional}. Its principal ranks are:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Backbone region & LoRA rank \\
+\midrule
+DNA convolution & 2 \\
+Residual tower and first U-Net block & 6 \\
+Transformer-associated layers & 30 \\
+Horizontal and upsampling convolutions & 30 \\
+Separable convolutions & 10 \\
+Final joined convolutions & 60 \\
+Output heads & 1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Most selected layers use conditional LoRA. The transformer query, key, value, relative-key,
+and output projections are explicitly excluded from conditional LoRA; they receive ordinary
+input-independent LoRA adapters instead. This exception is specified by
+\code{exclude\_cond\_lora\_patterns} in
+\code{src/bolero/tl/model/borzoi/model\_lora\_config.py}.
+
+\section{Building the conditioning vector}
+
+\subsection{Single-dataset training}
+
+The paired pseudobulk pipeline samples a background pseudobulk $p_0$ and a target pseudobulk
+$p_1$. Their cell-state embeddings are concatenated:
+
+\[
+\condvec_{\mathrm{cell}} = [\condvec_{p_0};\condvec_{p_1}].
+\]
+
+For example, two 30-dimensional metacell embeddings give a 60-dimensional input to the
+LoRA generators. The background embedding describes the reference state, while the target
+embedding describes the state whose track is to be predicted. The construction is performed
+by \code{EnsemblePairedPseudobulker} in
+\code{src/bolero/tl/pseudobulk/paired\_pseudobulk.py}.
+
+Optional condition variables, such as tissue, developmental state, or TF activity, are
+encoded separately. \code{ConditionEmbeddingModule} applies small encoders to the cell and
+condition inputs and concatenates their outputs. If no condition variables are present, the
+module is replaced by a no-effect module and the cell embedding is passed through unchanged.
+
+\subsection{Multi-dataset training}
+
+Different datasets can have different embedding spaces and condition schemas. The
+multi-dataset model therefore uses:
+
+\begin{itemize}[leftmargin=2em]
+  \item a dataset-specific cell encoder;
+  \item a dataset-specific condition encoder when conditions exist;
+  \item a shared encoder for genome/species and other shared metadata.
+\end{itemize}
+
+The resulting dataset-specific and shared representations are concatenated into one vector
+of fixed width before being supplied to all conditional-LoRA generators. This allows one
+shared backbone to serve multiple datasets while retaining dataset-specific conditioning.
+
+\section{Signal-model forward pass}
+
+With \code{signal\_model=True}, the model receives the background signal from $p_0$ in
+addition to DNA. The signal is transformed with $\log(1+s)$ and passed through a small
+convolutional encoder. Its output is injected into the DNA representation at 32 bp
+resolution. The subsequent Borzoi residual tower, U-Net path, transformer, and upsampling
+path all receive the same conditioning vector and therefore use state-specific adapters.
+
+The target output is produced by a 1D output head. For the default count head, a softplus
+activation makes predictions nonnegative and training uses the Poisson-multinomial loss.
+In paired training, the model can also predict the difference between target and background
+signals with an auxiliary delta head and mean-squared-error loss.
+
+At training time, the background signal is randomly omitted with probability
+\code{nosignal\_prob} (default 0.2). This prevents the model from depending entirely on the
+background track and encourages prediction from DNA plus conditioning. At inference time,
+the signal input may be omitted; the DNA and conditioning paths remain available.
+
+\section{Training and trainable parameters}
+
+The trainer first loads the pretrained Borzoi checkpoint and freezes the backbone. It then
+converts the configured layers to LoRA modules. The base convolution and linear weights
+remain frozen, while the following components are trainable in the standard recipe:
+
+\begin{itemize}[leftmargin=2em]
+  \item conditional-LoRA generator MLPs;
+  \item ordinary LoRA parameters in the attention projections;
+  \item the cell/condition encoders;
+  \item the output heads;
+  \item the signal encoder and enabled auxiliary heads.
+\end{itemize}
+
+The optimizer is built from parameters whose \code{requires\_grad} flag is true. The
+backbone is thus reused as a strong sequence prior, while the comparatively small adapter
+and conditioning components learn cell-state-specific regulation.
+
+\section{Collapsing for inference}
+
+For a fixed conditioning vector $\condvec^*$, every conditional layer can be evaluated once:
+
+\[
+W^* = \Wbase + \frac{\alpha}{r}B(\condvec^*)A(\condvec^*).
+\]
+
+\code{BorzoiLoRA.collapse\_lora(embedding)} replaces the conditional layers with ordinary
+PyTorch layers containing these fixed weights. The result is a conventional DNA-to-track
+model for one cell state. It is useful for fast repeated prediction and for base-level DNA
+attribution. A different collapsed model is needed for each conditioning vector whose
+effective network is to be inspected.
+
+\section{Implementation map}
+
+\begin{center}
+\begin{tabular}{p{0.38\linewidth}p{0.52\linewidth}}
+\toprule
+Component & Source file \\
+\midrule
+Conditional linear and convolutional LoRA & {\scriptsize\code{src/bolero/tl/generic/module\_lora\_cond.py}} \\
+Condition encoders and MLP generators & {\scriptsize\code{src/bolero/tl/generic/module\_embedding.py}} \\
+BorzoiLoRA construction and forward paths & {\scriptsize\code{src/bolero/tl/model/borzoi/model\_lora.py}} \\
+Layer/rank presets & {\scriptsize\texttt{model\_lora\_config.py}} \\
+Paired training forward pass & {\scriptsize\code{src/bolero/tl/model/borzoi/train.py}} \\
+Pseudobulk pairing and embeddings & {\scriptsize\code{src/bolero/tl/pseudobulk/paired\_pseudobulk.py}} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
