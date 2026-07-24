@@ -13,3 +13,7 @@ Bolero as a frozen Borzoi/Flashzoi backbone with per-layer conditional LoRA, inc
 
 The source was checked against `BorzoiLoRA`, `module_lora_cond`, `module_embedding`, the
 LoRA configuration presets, and the Borzoi training/data paths.
+
+Follow-up clarification: the note now gives the explicit grouped-convolution LoRA
+parameterization and identifies the current cell-state embeddings as 30-dimensional joint
+RNA--ATAC MULTIVI latents, rather than expression PCs.

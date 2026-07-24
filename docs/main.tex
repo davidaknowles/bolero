@@ -49,19 +49,6 @@ transcript track at 32 bp resolution. The backbone produces 16,384 internal outp
 the default training crop is 16,352 bins (see \code{crop\_to\_length} in
 \code{src/bolero/tl/model/borzoi/model.py}).
 
-The high-level computation is:
-
-\begin{center}
-\fbox{\parbox{0.88\linewidth}{
-\centering
-DNA sequence $x$ \, + \, cell state and optional conditions
-\quad $\longrightarrow$ \quad conditioning encoder $\longrightarrow$ $\condvec$
-\\[3pt]
-$x$ and $\condvec$ pass through a frozen Borzoi backbone with generated LoRA updates
-\quad $\longrightarrow$ \quad predicted track $\hat y$
-}}
-\end{center}
-
 The main implementation is \code{BorzoiLoRA} in
 \code{src/bolero/tl/model/borzoi/model\_lora.py}. The base checkpoint is loaded first,
 and selected convolutional and linear layers are then replaced by LoRA modules.
@@ -89,10 +76,49 @@ $(o,r)$, contracts them over the rank dimension, and adds the result to the froz
 weight. The scale is $\alpha/r$; with the default configuration, $\alpha$ is obtained from
 the rank and the configured LoRA scale.
 
-The same construction is used for convolutional layers. The generated update is reshaped
-to the convolution kernel shape. During a batched forward pass, each example's effective
-kernel is applied independently using a grouped convolution. Consequently, a batch may
-contain different cell-state-specific kernels without running the backbone once per cell.
+\subsection{Explicit convolutional parameterization}
+
+For a one-dimensional convolution with base kernel
+\[
+K_0 \in \mathbb{R}^{o\times(i/g)\times k},
+\]
+where $i$ and $o$ are the input and output channel counts, $g$ is the number of groups,
+and $k$ is the kernel width, the implementation flattens the channel--kernel dimensions
+before applying the low-rank factorization. For conditioning vector $\condvec$, its two
+MLPs generate
+\begin{align}
+A_c(\condvec) &\in \mathbb{R}^{(rk)\times((i/g)k)},\\
+B_c(\condvec) &\in \mathbb{R}^{o\times(rk)}.
+\end{align}
+The generated convolution update is
+\[
+\Delta K(\condvec) = \frac{\alpha}{r}\,
+\operatorname{reshape}_{o,\,i/g,\,k}\!\left[
+B_c(\condvec)A_c(\condvec)\right],
+\]
+and the effective kernel for one example is
+\[
+K(\condvec) = K_0 + \Delta K(\condvec).
+\]
+Thus, the factorization rank in the flattened representation is $rk$; the code's LoRA
+rank parameter is $r$, and the kernel width is folded into both generated factors. For a
+two-dimensional convolution, the analogous generator shapes are
+\[
+A_c(\condvec)\in\mathbb{R}^{(rk)\times((i/g)k)},\qquad
+B_c(\condvec)\in\mathbb{R}^{(ok)\times(rk)},
+\]
+followed by reshaping $B_cA_c$ to $(o,i/g,k,k)$.
+
+For a batch of $b$ examples, the one-dimensional implementation generates
+$K(\condvec_1),\ldots,K(\condvec_b)$, concatenates them into a grouped-convolution weight
+tensor
+\[
+K_{\mathrm{batch}}\in\mathbb{R}^{(bo)\times(i/g)\times k},
+\]
+reshapes the input $X\in\mathbb{R}^{b\times i\times L}$ to
+$X'\in\mathbb{R}^{1\times(bi)\times L}$, and calls convolution with $bg$ groups. The
+output is reshaped back to $Y\in\mathbb{R}^{b\times o\times L'}$. Each example therefore
+uses its own conditional kernel while the batch is processed in one grouped operation.
 
 The conditional layer implementation is in
 \code{src/bolero/tl/generic/module\_lora\_cond.py}. Its two defining properties are:
@@ -133,6 +159,27 @@ input-independent LoRA adapters instead. This exception is specified by
 \code{src/bolero/tl/model/borzoi/model\_lora\_config.py}.
 
 \section{Building the conditioning vector}
+
+\subsection{What is the cell-state embedding?}
+
+In the current embedding tutorial, the cell-state embedding is \emph{not} a set of
+expression principal components. It is a learned latent representation from a joint
+RNA--ATAC \textsc{MultiVI} model (implemented by \code{scvi-tools}). The worked tutorial
+uses a 30-dimensional latent vector. MultiVI is trained on raw RNA counts for the top
+5,000 highly variable genes and ATAC peak counts, with donor/experimental batch modeled as
+a covariate. The trained model is then applied to all cells, and the latent representation
+is stored as \code{X\_multivi} / \code{multivi.latent\_embedding.feather}.
+
+SEACells uses this joint latent space to form homogeneous metacells. Bolero does not
+usually feed individual noisy cells directly to the sequence model: the pseudobulk records
+carry the embedding associated with each metacell or pseudobulk. A pseudobulk embedding is
+typically the mean of the embeddings of its selected metacells. Therefore, the embedding
+is a learned multimodal cell-state coordinate, not an expression-only PCA score. The
+embedding dimensionality and model can be changed by the data-preparation workflow; the
+LoRA input width is read from the resulting records.
+The LoRA code itself is agnostic to the embedding's provenance: an expression-PCA vector
+could be supplied through the same \code{emb\_key} interface, but that is not the embedding
+used by the current MULTIVI-based tutorial and atlas recipe.
 
 \subsection{Single-dataset training}
 
